@@ -29,6 +29,39 @@ import win32clipboard
 import pystray
 from PIL import Image, ImageDraw
 
+
+# ---------------------------------------------------------------------------
+# 高 DPI 感知
+# ---------------------------------------------------------------------------
+def _enable_dpi_awareness():
+    """声明进程为 DPI 感知,否则高分屏下系统会位图拉伸界面,菜单文字发虚。
+
+    优先用 Per-Monitor v2(Win10 1703+),逐级回退到老接口。必须在创建任何
+    窗口之前调用。
+    """
+    import ctypes
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(
+            ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2 (Win8.1+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()   # 系统级,最老接口
+    except Exception:
+        pass
+
+
+_enable_dpi_awareness()
+
+
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
