@@ -7,7 +7,9 @@ Explorer 路径历史托盘工具
   - 后台轮询当前打开的「文件资源管理器」窗口，记录你浏览过的真实文件夹路径。
   - 右键托盘图标 -> 显示最近 10 条路径历史(最新的在最上面)。
   - 点击某条路径 -> 用资源管理器打开它。
-  - 历史会保存到本地文件,重启后仍在。
+  - 弹出菜单后高亮某条路径(鼠标悬停或方向键)并按 Ctrl+C -> 复制该路径。
+  - 菜单里「自定义快捷键」-> 弹窗按下任意组合键,即可改掉默认的弹出热键。
+  - 历史与配置会保存到本地文件,重启后仍在。
 
 依赖: pywin32, pystray, Pillow
 运行: pythonw explorer_path_tray.py   (用 pythonw 不弹黑窗口)
@@ -23,6 +25,7 @@ import pythoncom
 import win32com.client
 import win32gui
 import win32con
+import win32clipboard
 import pystray
 from PIL import Image, ImageDraw
 
@@ -31,10 +34,15 @@ from PIL import Image, ImageDraw
 # ---------------------------------------------------------------------------
 MAX_HISTORY = 10            # 最多保留多少条路径
 POLL_INTERVAL = 1.5         # 轮询间隔(秒)
+# 历史保存在脚本所在的项目目录下
 HISTORY_FILE = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-    "ExplorerPathTray",
+    os.path.dirname(os.path.abspath(__file__)),
     "history.json",
+)
+# 配置(含自定义快捷键)同样保存在项目目录下
+CONFIG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "config.json",
 )
 
 # ---------------------------------------------------------------------------
@@ -238,6 +246,7 @@ def menu_items():
             label = path.replace("&", "&&")
             yield pystray.MenuItem(label, _make_open(path))
     yield pystray.Menu.SEPARATOR
+    yield pystray.MenuItem("自定义快捷键…", _on_set_hotkey)
     yield pystray.MenuItem("退出(&X)", _on_quit)
 
 
@@ -245,17 +254,346 @@ def menu_items():
 # 全局快捷键: Ctrl+Shift+Win+P -> 在鼠标位置弹出菜单
 # ---------------------------------------------------------------------------
 import ctypes  # noqa: E402
+from ctypes import wintypes  # noqa: E402
 
 WM_HOTKEY = 0x0312
+WM_APP_REHOTKEY = win32con.WM_APP + 1   # 通知热键线程重新注册热键
+MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 HOTKEY_ID = 1
-HOTKEY_MODS = MOD_CONTROL | MOD_SHIFT | MOD_WIN | MOD_NOREPEAT
-HOTKEY_VK = 0x50  # 'P'
+DEFAULT_HOTKEY_MODS = MOD_CONTROL | MOD_SHIFT | MOD_WIN   # 默认 Ctrl+Shift+Win+P
+DEFAULT_HOTKEY_VK = 0x50  # 'P'
+
+# 当前生效的热键(可在运行时自定义);_load_config 会用配置文件覆盖
+_hotkey_mods = DEFAULT_HOTKEY_MODS | MOD_NOREPEAT
+_hotkey_vk = DEFAULT_HOTKEY_VK
+_pending_hotkey = None     # 待应用的 (mods, vk),不含 MOD_NOREPEAT
+_dialog_open = False       # 自定义快捷键对话框是否已打开
 
 _hotkey_hwnd = None
+
+
+# ---------------------------------------------------------------------------
+# 菜单内按 Ctrl+C 复制高亮项的路径
+# ---------------------------------------------------------------------------
+# pystray 弹出菜单基于 Win32 TrackPopupMenu,它自带模态消息循环,普通按键
+# 不会发到窗口过程。所以这里在菜单显示期间装一个低级键盘钩子来捕获 Ctrl+C,
+# 并用 WM_MENUSELECT 实时记录当前高亮的是哪一项。
+_menu_highlight_id = 0   # 当前高亮菜单项 id(由 WM_MENUSELECT 维护)
+_popup_actions = {}      # 菜单项 id -> (类型, 数据)
+
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_MENU = 0x12          # Alt
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+VK_C = 0x43
+
+_user32 = ctypes.windll.user32
+_HOOKPROC = ctypes.CFUNCTYPE(
+    ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+# 显式声明指针类型,避免 64 位下句柄被截断
+_user32.SetWindowsHookExW.restype = ctypes.c_void_p
+_user32.SetWindowsHookExW.argtypes = [
+    ctypes.c_int, _HOOKPROC, ctypes.c_void_p, wintypes.DWORD]
+_user32.CallNextHookEx.restype = ctypes.c_ssize_t
+_user32.CallNextHookEx.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+_user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+_user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+_user32.RegisterHotKey.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+_user32.RegisterHotKey.restype = wintypes.BOOL
+_user32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_user32.UnregisterHotKey.restype = wintypes.BOOL
+_user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+_user32.GetAsyncKeyState.restype = ctypes.c_short
+
+
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wintypes.DWORD),
+                ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_void_p)]
+
+
+_kbd_hook_handle = None
+_kbd_hook_proc = None    # 必须保留引用,否则回调被 GC 回收会崩溃
+
+
+def _copy_to_clipboard(text):
+    """把文本写入剪贴板;剪贴板偶尔被占用,所以做几次重试。"""
+    for _ in range(5):
+        try:
+            win32clipboard.OpenClipboard()
+        except Exception:
+            time.sleep(0.02)
+            continue
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+        return True
+    return False
+
+
+def _copy_path_async(path):
+    """在独立线程里复制路径并弹气泡提示(钩子回调里不宜做耗时操作)。"""
+    def worker():
+        if _copy_to_clipboard(path) and _icon is not None:
+            try:
+                _icon.notify("已复制路径:\n" + path, "Explorer 路径历史")
+            except Exception:
+                pass
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _try_copy_highlighted():
+    """复制当前高亮项对应的路径;成功返回 True。"""
+    action = _popup_actions.get(_menu_highlight_id)
+    if not action or action[0] != "open":
+        return False
+    _copy_path_async(action[1])
+    _user32.EndMenu()    # 复制后关闭菜单,方便用户直接去粘贴
+    return True
+
+
+def _ll_keyboard_proc(nCode, wParam, lParam):
+    if nCode == 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+        kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+        if kb.vkCode == VK_C and (_user32.GetAsyncKeyState(VK_CONTROL) & 0x8000):
+            if _try_copy_highlighted():
+                return 1     # 吞掉这次 Ctrl+C,不再向下传递
+    return _user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+def _install_keyboard_hook():
+    global _kbd_hook_handle, _kbd_hook_proc
+    _kbd_hook_proc = _HOOKPROC(_ll_keyboard_proc)
+    _kbd_hook_handle = _user32.SetWindowsHookExW(
+        WH_KEYBOARD_LL, _kbd_hook_proc, win32gui.GetModuleHandle(None), 0)
+
+
+def _uninstall_keyboard_hook():
+    global _kbd_hook_handle, _kbd_hook_proc
+    if _kbd_hook_handle:
+        try:
+            _user32.UnhookWindowsHookEx(_kbd_hook_handle)
+        except Exception:
+            pass
+    _kbd_hook_handle = None
+    _kbd_hook_proc = None
+
+
+# ---------------------------------------------------------------------------
+# 自定义全局快捷键
+# ---------------------------------------------------------------------------
+# 修饰键的虚拟键码(捕获时用来判断"还没按到主键")
+_MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C,
+                 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+
+# 常见非字母数字键的可读名字
+_VK_NAMES = {
+    0x08: "Backspace", 0x09: "Tab", 0x0D: "Enter", 0x1B: "Esc",
+    0x20: "Space", 0x21: "PageUp", 0x22: "PageDown", 0x23: "End",
+    0x24: "Home", 0x25: "Left", 0x26: "Up", 0x27: "Right", 0x28: "Down",
+    0x2D: "Insert", 0x2E: "Delete",
+}
+for _i in range(12):
+    _VK_NAMES[0x70 + _i] = "F" + str(_i + 1)
+del _i
+
+
+def _notify(text, title="Explorer 路径历史"):
+    if _icon is not None:
+        try:
+            _icon.notify(text, title)
+        except Exception:
+            pass
+
+
+def _vk_name(vk):
+    if vk in _VK_NAMES:
+        return _VK_NAMES[vk]
+    if 0x30 <= vk <= 0x5A:        # 0-9 与 A-Z 的 VK 即其 ASCII
+        return chr(vk)
+    return "VK_{:02X}".format(vk)
+
+
+def _format_hotkey(mods, vk):
+    """把 (修饰位, 主键) 格式化成 'Ctrl + Shift + P' 这样的可读文字。"""
+    parts = []
+    if mods & MOD_CONTROL:
+        parts.append("Ctrl")
+    if mods & MOD_SHIFT:
+        parts.append("Shift")
+    if mods & MOD_ALT:
+        parts.append("Alt")
+    if mods & MOD_WIN:
+        parts.append("Win")
+    if vk:
+        parts.append(_vk_name(vk))
+    return " + ".join(parts) if parts else "(未设置)"
+
+
+def _current_modifiers():
+    """读取此刻按下的修饰键,返回 RegisterHotKey 用的 MOD_* 组合。"""
+    g = _user32.GetAsyncKeyState
+    mods = 0
+    if g(VK_CONTROL) & 0x8000:
+        mods |= MOD_CONTROL
+    if g(VK_SHIFT) & 0x8000:
+        mods |= MOD_SHIFT
+    if g(VK_MENU) & 0x8000:
+        mods |= MOD_ALT
+    if (g(VK_LWIN) & 0x8000) or (g(VK_RWIN) & 0x8000):
+        mods |= MOD_WIN
+    return mods
+
+
+def _load_config():
+    global _hotkey_mods, _hotkey_vk
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        hk = data.get("hotkey") or {}
+        mods = int(hk["mods"])
+        vk = int(hk["vk"])
+        _hotkey_mods = (mods & ~MOD_NOREPEAT) | MOD_NOREPEAT
+        _hotkey_vk = vk
+    except (OSError, ValueError, TypeError, KeyError):
+        _hotkey_mods = DEFAULT_HOTKEY_MODS | MOD_NOREPEAT
+        _hotkey_vk = DEFAULT_HOTKEY_VK
+
+
+def _save_config():
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"hotkey": {"mods": _hotkey_mods & ~MOD_NOREPEAT,
+                                  "vk": _hotkey_vk}},
+                      f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def apply_hotkey(mods, vk):
+    """记录待应用的热键,并通知热键线程去重新注册(注册必须在该线程做)。"""
+    global _pending_hotkey
+    _pending_hotkey = (mods, vk)
+    if _hotkey_hwnd:
+        win32gui.PostMessage(_hotkey_hwnd, WM_APP_REHOTKEY, 0, 0)
+
+
+def _reregister_hotkey():
+    """在热键线程内执行:用待应用的组合重新注册全局热键,失败则回滚。"""
+    global _hotkey_mods, _hotkey_vk
+    if _pending_hotkey is None or not _hotkey_hwnd:
+        return
+    mods, vk = _pending_hotkey
+    new_mods = mods | MOD_NOREPEAT
+    _user32.UnregisterHotKey(_hotkey_hwnd, HOTKEY_ID)
+    if _user32.RegisterHotKey(_hotkey_hwnd, HOTKEY_ID, new_mods, vk):
+        _hotkey_mods, _hotkey_vk = new_mods, vk
+        _save_config()
+        _notify("快捷键已设为 " + _format_hotkey(mods, vk))
+    else:
+        # 新组合注册失败(多半被占用),回滚到之前能用的热键
+        _user32.RegisterHotKey(_hotkey_hwnd, HOTKEY_ID, _hotkey_mods, _hotkey_vk)
+        _notify("设置失败:" + _format_hotkey(mods, vk) + " 可能已被占用")
+
+
+def _capture_hotkey_dialog():
+    """弹出小窗口捕获用户按下的组合键,确认后应用为新的全局快捷键。"""
+    global _dialog_open
+    if _dialog_open:
+        return
+    _dialog_open = True
+    try:
+        import tkinter as tk
+    except Exception:
+        _notify("无法打开设置窗口(缺少 tkinter)")
+        _dialog_open = False
+        return
+
+    pending = {"mods": _hotkey_mods & ~MOD_NOREPEAT, "vk": _hotkey_vk}
+
+    root = tk.Tk()
+    root.title("自定义快捷键")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+
+    tk.Label(root,
+             text="请按下想要的组合键\n(需至少包含一个修饰键 Ctrl / Shift / Alt / Win)",
+             justify="center", padx=24, pady=10).pack()
+
+    combo_var = tk.StringVar(value=_format_hotkey(pending["mods"], pending["vk"]))
+    tk.Label(root, textvariable=combo_var,
+             font=("Segoe UI", 15, "bold"), fg="#0a7", pady=4).pack()
+
+    hint_var = tk.StringVar(value="")
+    tk.Label(root, textvariable=hint_var, fg="#c00").pack()
+
+    def on_keypress(event):
+        vk = event.keycode
+        if vk in _MODIFIER_VKS:      # 只按了修饰键,等主键
+            return "break"
+        mods = _current_modifiers()
+        pending["mods"] = mods
+        pending["vk"] = vk
+        combo_var.set(_format_hotkey(mods, vk))
+        hint_var.set("" if mods else "缺少修饰键,可能无法注册")
+        return "break"
+
+    root.bind("<KeyPress>", on_keypress)
+
+    btns = tk.Frame(root)
+    btns.pack(pady=12)
+
+    def save():
+        if pending["vk"] and pending["mods"]:
+            apply_hotkey(pending["mods"], pending["vk"])
+            root.destroy()
+        else:
+            hint_var.set("请至少包含一个修饰键再按主键")
+
+    def cancel():
+        root.destroy()
+
+    tk.Button(btns, text="保存", width=8, command=save).pack(side="left", padx=8)
+    tk.Button(btns, text="取消", width=8, command=cancel).pack(side="left", padx=8)
+
+    # 居中显示
+    root.update_idletasks()
+    w, h = root.winfo_width(), root.winfo_height()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry("+{}+{}".format((sw - w) // 2, (sh - h) // 2))
+
+    root.lift()
+    root.focus_force()
+    try:
+        root.mainloop()
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        _dialog_open = False
+
+
+def _on_set_hotkey(icon=None, item=None):
+    # tkinter 在独立线程跑自己的 mainloop,避免阻塞托盘
+    threading.Thread(target=_capture_hotkey_dialog, daemon=True).start()
 
 
 class _GUID(ctypes.Structure):
@@ -302,8 +640,10 @@ def _get_tray_icon_rect():
 
 def _show_popup_menu(hwnd):
     """在鼠标位置弹出与右键托盘一致的菜单。"""
+    global _popup_actions, _menu_highlight_id
     hmenu = win32gui.CreatePopupMenu()
-    actions = {}  # 菜单项 id -> (类型, 数据)
+    _popup_actions = {}  # 菜单项 id -> (类型, 数据)
+    _menu_highlight_id = 0
     next_id = 1
     snapshot = history_snapshot()
     if not snapshot:
@@ -315,11 +655,14 @@ def _show_popup_menu(hwnd):
             # '&' 在菜单文字里是助记符,需转义成 '&&' 才会原样显示
             win32gui.AppendMenu(
                 hmenu, win32con.MF_STRING, next_id, path.replace("&", "&&"))
-            actions[next_id] = ("open", path)
+            _popup_actions[next_id] = ("open", path)
             next_id += 1
     win32gui.AppendMenu(hmenu, win32con.MF_SEPARATOR, 0, "")
+    win32gui.AppendMenu(hmenu, win32con.MF_STRING, next_id, "自定义快捷键…")
+    _popup_actions[next_id] = ("set_hotkey", None)
+    next_id += 1
     win32gui.AppendMenu(hmenu, win32con.MF_STRING, next_id, "退出(&X)")
-    actions[next_id] = ("quit", None)
+    _popup_actions[next_id] = ("quit", None)
 
     # 菜单位置:锚定到托盘图标右上角,并用与右键一致的右下对齐,
     # 让菜单贴着图标向左上展开;取不到图标位置时回退到鼠标处。
@@ -334,23 +677,43 @@ def _show_popup_menu(hwnd):
         win32gui.SetForegroundWindow(hwnd)
     except Exception:
         pass
-    cmd = win32gui.TrackPopupMenu(
-        hmenu, align | win32con.TPM_RETURNCMD, x, y, 0, hwnd, None)
+    # 菜单显示期间装上键盘钩子,这样高亮某项时按 Ctrl+C 就能复制其路径
+    _install_keyboard_hook()
+    try:
+        cmd = win32gui.TrackPopupMenu(
+            hmenu, align | win32con.TPM_RETURNCMD, x, y, 0, hwnd, None)
+    finally:
+        _uninstall_keyboard_hook()
     win32gui.PostMessage(hwnd, win32con.WM_NULL, 0, 0)
     win32gui.DestroyMenu(hmenu)
 
-    action = actions.get(cmd)
+    action = _popup_actions.get(cmd)
     if action:
         kind, data = action
         if kind == "open":
             open_path(data)
+        elif kind == "set_hotkey":
+            _on_set_hotkey()
         elif kind == "quit":
             _quit_app()
 
 
 def _hotkey_wndproc(hwnd, msg, wparam, lparam):
+    global _menu_highlight_id
     if msg == WM_HOTKEY and wparam == HOTKEY_ID:
         _show_popup_menu(hwnd)
+        return 0
+    if msg == WM_APP_REHOTKEY:
+        _reregister_hotkey()
+        return 0
+    if msg == win32con.WM_MENUSELECT:
+        # wParam: 低字=菜单项 id(或子菜单索引), 高字=菜单标志
+        item_id = wparam & 0xFFFF
+        flags = (wparam >> 16) & 0xFFFF
+        if (flags == 0xFFFF and lparam == 0) or (flags & win32con.MF_POPUP):
+            _menu_highlight_id = 0   # 菜单已关闭或高亮的是子菜单
+        else:
+            _menu_highlight_id = item_id
         return 0
     if msg == win32con.WM_DESTROY:
         win32gui.PostQuitMessage(0)
@@ -373,21 +736,18 @@ def hotkey_loop():
             class_atom, "ExplorerPathTrayHotkey", 0, 0, 0, 0, 0, 0, 0, hinst, None)
         _hotkey_hwnd = hwnd
 
-        if not ctypes.windll.user32.RegisterHotKey(
-                hwnd, HOTKEY_ID, HOTKEY_MODS, HOTKEY_VK):
-            # 注册失败(多半是热键已被占用),通过气泡提示一下
-            if _icon is not None:
-                try:
-                    _icon.notify("快捷键 Ctrl+Shift+Win+P 注册失败(可能已被占用)",
-                                 "Explorer 路径历史")
-                except Exception:
-                    pass
-            return
+        if not _user32.RegisterHotKey(
+                hwnd, HOTKEY_ID, _hotkey_mods, _hotkey_vk):
+            # 注册失败(多半是热键已被占用),提示一下;不退出线程,
+            # 这样用户仍可通过菜单把它改成别的可用组合。
+            _notify("快捷键 "
+                    + _format_hotkey(_hotkey_mods & ~MOD_NOREPEAT, _hotkey_vk)
+                    + " 注册失败(可能已被占用),可在菜单里改成别的组合")
 
         try:
             win32gui.PumpMessages()
         finally:
-            ctypes.windll.user32.UnregisterHotKey(hwnd, HOTKEY_ID)
+            _user32.UnregisterHotKey(hwnd, HOTKEY_ID)
     finally:
         pythoncom.CoUninitialize()
 
@@ -420,6 +780,7 @@ def make_icon_image():
 def main():
     global _icon
     _load_history()
+    _load_config()
 
     def setup(icon):
         icon.visible = True
