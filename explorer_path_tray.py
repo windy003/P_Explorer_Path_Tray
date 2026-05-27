@@ -232,10 +232,25 @@ def _open_and_maximize(path):
     """在独立线程中打开路径并最大化窗口(独立线程便于隔离 COM)。"""
     pythoncom.CoInitialize()
     try:
+        if not os.path.isdir(path):
+            # 路径已不存在 -> 从历史中移除并刷新菜单
+            remove_path(path)
+            if _icon is not None:
+                try:
+                    _icon.update_menu()
+                except Exception:
+                    pass
+            return
+        # 已有资源管理器窗口时,优先在其中新建标签页打开
+        try:
+            if _open_in_existing_tab(path):
+                return
+        except Exception:
+            pass
+        # 否则(没有已开窗口,或新建标签失败)开新窗口并最大化
         try:
             os.startfile(path)
         except OSError:
-            # 路径已不存在 -> 从历史中移除并刷新菜单
             remove_path(path)
             if _icon is not None:
                 try:
@@ -427,6 +442,172 @@ def _uninstall_keyboard_hook():
             pass
     _kbd_hook_handle = None
     _kbd_hook_proc = None
+
+
+# ---------------------------------------------------------------------------
+# 在已有资源管理器窗口中新建标签页打开路径
+# ---------------------------------------------------------------------------
+# Windows 11 的资源管理器标签页没有公开 API,只能模拟键盘:把目标窗口切到
+# 前台 -> Ctrl+T 新建标签 -> Ctrl+L 定位地址栏 -> 输入路径 -> 回车导航。
+# 没有已开窗口或中途失败时,调用方会回退到"开新窗口并最大化"。
+VK_RETURN = 0x0D
+VK_L = 0x4C
+VK_T = 0x54
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+# 各步骤之间的等待(秒);太短会因为标签/地址栏还没就绪而丢键
+_FG_SETTLE = 0.08      # 切前台后稳定一下
+_TAB_NEW = 0.18        # 等新标签建立
+_ADDR_FOCUS = 0.06     # 等地址栏获得焦点
+_NAV_ENTER = 0.04      # 输入完到回车
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_void_p)]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_void_p)]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+
+_user32.SendInput.argtypes = [
+    wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+_user32.SendInput.restype = wintypes.UINT
+
+
+def _key_event(vk, scan, flags):
+    inp = _INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp.u.ki = _KEYBDINPUT(vk, scan, flags, 0, None)
+    return inp
+
+
+def _send_inputs(events):
+    if not events:
+        return
+    arr = (_INPUT * len(events))(*events)
+    _user32.SendInput(len(events), arr, ctypes.sizeof(_INPUT))
+
+
+def _send_ctrl_combo(vk):
+    """按下 Ctrl + 某键再松开(用于 Ctrl+T / Ctrl+L)。"""
+    _send_inputs([
+        _key_event(VK_CONTROL, 0, 0),
+        _key_event(vk, 0, 0),
+        _key_event(vk, 0, KEYEVENTF_KEYUP),
+        _key_event(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+    ])
+
+
+def _send_vk(vk):
+    _send_inputs([
+        _key_event(vk, 0, 0),
+        _key_event(vk, 0, KEYEVENTF_KEYUP),
+    ])
+
+
+def _type_unicode(text):
+    """逐字符以 Unicode 方式输入,绕开输入法与键盘布局,也不动用户剪贴板。"""
+    events = []
+    for ch in text:
+        code = ord(ch)
+        events.append(_key_event(0, code, KEYEVENTF_UNICODE))
+        events.append(_key_event(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+    _send_inputs(events)
+
+
+def _open_explorer_hwnds():
+    """返回当前所有资源管理器窗口句柄(去重)。"""
+    hwnds = []
+    try:
+        shell = win32com.client.Dispatch("Shell.Application")
+        windows = shell.Windows()
+    except Exception:
+        return hwnds
+    for window in windows:
+        try:
+            full = (window.FullName or "").lower()
+            if not full.endswith("explorer.exe"):
+                continue
+            hwnd = int(window.HWND)
+        except Exception:
+            continue
+        if hwnd and hwnd not in hwnds and win32gui.IsWindow(hwnd):
+            hwnds.append(hwnd)
+    return hwnds
+
+
+def _topmost_hwnd(hwnds):
+    """在句柄集合里返回 Z 序最靠前(最近激活)的那个窗口。"""
+    if not hwnds:
+        return None
+    try:
+        remaining = set(hwnds)
+        hwnd = win32gui.GetTopWindow(0)
+        while hwnd:
+            if hwnd in remaining:
+                return hwnd
+            hwnd = win32gui.GetWindow(hwnd, win32con.GW_HWNDNEXT)
+    except Exception:
+        pass
+    return hwnds[0]
+
+
+def _open_in_existing_tab(path):
+    """若已有资源管理器窗口,在其中新建标签页并导航到 path。
+
+    成功返回 True;没有可用窗口或中途失败返回 False(交给调用方回退)。
+    """
+    hwnds = _open_explorer_hwnds()
+    if not hwnds:
+        return False
+    hwnd = _topmost_hwnd(hwnds)
+    if not hwnd:
+        return False
+    # 最小化的话先恢复,否则切到前台仍不可见,按键也发不进去
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    except Exception:
+        pass
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        return False
+    time.sleep(_FG_SETTLE)
+    # 确认前台确实是目标窗口,否则放弃,避免把按键发到别的程序
+    if win32gui.GetForegroundWindow() != hwnd:
+        return False
+    _send_ctrl_combo(VK_T)         # 新建标签页
+    time.sleep(_TAB_NEW)
+    if win32gui.GetForegroundWindow() != hwnd:
+        return False
+    _send_ctrl_combo(VK_L)         # 定位地址栏
+    time.sleep(_ADDR_FOCUS)
+    _type_unicode(path)            # 输入目标路径
+    time.sleep(_NAV_ENTER)
+    _send_vk(VK_RETURN)            # 回车导航
+    return True
 
 
 # ---------------------------------------------------------------------------
