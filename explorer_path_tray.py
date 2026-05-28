@@ -28,6 +28,10 @@ import win32con
 import win32clipboard
 import pystray
 from PIL import Image, ImageDraw
+from dotenv import load_dotenv
+
+# 从项目根目录的 .env 读取配置
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +69,15 @@ _enable_dpi_awareness()
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
-MAX_HISTORY = 10            # 最多保留多少条路径
+def _env_int(name, default):
+    """从环境变量读取整数,缺失或非法时回退到默认值。"""
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_HISTORY = _env_int("MAX_HISTORY", 20)   # 最多保留多少条路径(来自 .env)
 POLL_INTERVAL = 1.5         # 轮询间隔(秒)
 # 历史保存在脚本所在的项目目录下
 HISTORY_FILE = os.path.join(
