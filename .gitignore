@@ -2,3 +2,4 @@ __pycache__/
 .claude/
 config.json
 history.json
+cursor_recent.json

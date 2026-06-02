@@ -1,0 +1,15 @@
+{
+  "name": "vsce-remember-path",
+  "displayName": "Remember Path (Explorer Path Tray Sync)",
+  "description": "Record the path of the project opened in Cursor/VS Code into a JSON file consumed by the Explorer Path Tray app.",
+  "version": "0.0.1",
+  "publisher": "windy003",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {}
+}

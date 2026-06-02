@@ -90,6 +90,16 @@ CONFIG_FILE = os.path.join(
     "config.json",
 )
 
+# Cursor 监控配置(来自 .env)
+# 数据来源: Cursor 扩展 VSCE_Remember_Path 写入的 cursor_recent.json,
+# 列表 LRU 排序,最新在最前。
+CURSOR_ENABLED = os.getenv("CURSOR_ENABLED", "1").strip() not in ("0", "false", "False", "")
+CURSOR_POLL_INTERVAL = max(1, _env_int("CURSOR_POLL_INTERVAL", 2))
+CURSOR_RECENT_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "cursor_recent.json",
+)
+
 # ---------------------------------------------------------------------------
 # 历史记录(线程安全)
 # ---------------------------------------------------------------------------
@@ -199,6 +209,47 @@ def poll_loop():
             stop.wait(POLL_INTERVAL)
     finally:
         pythoncom.CoUninitialize()
+
+
+def _read_cursor_latest_folder():
+    """读取 cursor_recent.json 第一条路径(LRU 最前一项),失败返回 None。
+
+    文件由 Cursor 扩展 VSCE_Remember_Path 在窗口启动时写入。
+    """
+    try:
+        with open(CURSOR_RECENT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, list):
+        return None
+    for item in data:
+        if isinstance(item, str) and os.path.isdir(item):
+            return os.path.normpath(item)
+    return None
+
+
+def cursor_watch_loop():
+    """后台线程:监控 Cursor 扩展写出的 cursor_recent.json,新项目自动加入历史。
+
+    策略:启动时把当前最新项目作为基线(不导入,避免一次塞满历史),
+    之后只要列表顶端变化(用户在 Cursor 里打开了别的项目)就记录一次。
+    """
+    last_seen = _read_cursor_latest_folder()
+    stop = _stop_event
+    while not stop.is_set():
+        stop.wait(CURSOR_POLL_INTERVAL)
+        if stop.is_set():
+            break
+        latest = _read_cursor_latest_folder()
+        if not latest or latest == last_seen:
+            continue
+        last_seen = latest
+        if add_path(latest) and _icon is not None:
+            try:
+                _icon.update_menu()
+            except Exception:
+                pass
 
 
 _stop_event = threading.Event()
@@ -1012,6 +1063,8 @@ def main():
         icon.visible = True
         threading.Thread(target=poll_loop, daemon=True).start()
         threading.Thread(target=hotkey_loop, daemon=True).start()
+        if CURSOR_ENABLED:
+            threading.Thread(target=cursor_watch_loop, daemon=True).start()
 
     _icon = pystray.Icon(
         "ExplorerPathTray",
