@@ -1,1 +1,1 @@
-start /b  pythonw  "D:\files\using\Python\P_Explorer_Path_Tray\explorer_path_tray.py"
+start /b "" "D:\files\using\Python\P_Explorer_Path_Tray\.venv\Scripts\pythonw.exe"  "D:\files\using\Python\P_Explorer_Path_Tray\explorer_path_tray.py"
