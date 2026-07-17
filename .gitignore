@@ -3,3 +3,4 @@ __pycache__/
 config.json
 history.json
 cursor_recent.json
+*.log

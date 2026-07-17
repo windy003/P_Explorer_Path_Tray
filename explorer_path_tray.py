@@ -20,6 +20,7 @@ import sys
 import json
 import time
 import threading
+import traceback
 
 import pythoncom
 import win32com.client
@@ -89,6 +90,23 @@ CONFIG_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "config.json",
 )
+# 运行日志(主要用于排查快捷键失效等问题),同样放项目目录下
+LOG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "hotkey.log",
+)
+_log_lock = threading.Lock()
+
+
+def _log(msg):
+    """把一行带时间戳的日志追加到 LOG_FILE;本身绝不抛异常。"""
+    try:
+        line = time.strftime("%Y-%m-%d %H:%M:%S") + "  " + str(msg) + "\n"
+        with _log_lock:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
 
 # Cursor 监控配置(来自 .env)
 # 数据来源: Cursor 扩展 VSCE_Remember_Path 写入的 cursor_recent.json,
@@ -368,7 +386,8 @@ import ctypes  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 
 WM_HOTKEY = 0x0312
-WM_APP_REHOTKEY = win32con.WM_APP + 1   # 通知热键线程重新注册热键
+WM_APP_REHOTKEY = win32con.WM_APP + 1   # 通知热键线程重新注册热键(应用新组合)
+WM_APP_REARM = win32con.WM_APP + 2      # 看门狗兜底:按当前组合重新注册一次热键
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
@@ -385,6 +404,7 @@ _pending_hotkey = None     # 待应用的 (mods, vk),不含 MOD_NOREPEAT
 _dialog_open = False       # 自定义快捷键对话框是否已打开
 
 _hotkey_hwnd = None
+_hotkey_class_seq = 0      # 窗口类名计数,保证每轮重建用到唯一类名
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +415,7 @@ _hotkey_hwnd = None
 # 并用 WM_MENUSELECT 实时记录当前高亮的是哪一项。
 _menu_highlight_id = 0   # 当前高亮菜单项 id(由 WM_MENUSELECT 维护)
 _popup_actions = {}      # 菜单项 id -> (类型, 数据)
+_menu_open = False       # 弹出菜单是否正在显示(用于热键的显示/关闭切换)
 
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
@@ -956,10 +977,13 @@ def _show_popup_menu(hwnd):
         pass
     # 菜单显示期间装上键盘钩子,这样高亮某项时按 Ctrl+C 就能复制其路径
     _install_keyboard_hook()
+    global _menu_open
+    _menu_open = True    # 标记菜单已打开,让再次按热键走"关闭"分支
     try:
         cmd = win32gui.TrackPopupMenu(
             hmenu, align | win32con.TPM_RETURNCMD, x, y, 0, hwnd, None)
     finally:
+        _menu_open = False
         _uninstall_keyboard_hook()
     win32gui.PostMessage(hwnd, win32con.WM_NULL, 0, 0)
     win32gui.DestroyMenu(hmenu)
@@ -978,10 +1002,34 @@ def _show_popup_menu(hwnd):
 def _hotkey_wndproc(hwnd, msg, wparam, lparam):
     global _menu_highlight_id
     if msg == WM_HOTKEY and wparam == HOTKEY_ID:
-        _show_popup_menu(hwnd)
+        # 关键:这里的任何异常都不能冒到 PumpMessages,否则热键线程会死掉,
+        # 表现就是"快捷键用一段时间后突然失效"。一律吞掉并记日志。
+        try:
+            if _menu_open:
+                # 菜单正开着 -> 再按一次热键把它关掉(显示/关闭切换)。
+                # EndMenu 会结束当前 TrackPopupMenu 的模态循环,让其返回。
+                _user32.EndMenu()
+            else:
+                _show_popup_menu(hwnd)
+        except Exception:
+            _log("_show_popup_menu 异常:\n" + traceback.format_exc())
         return 0
     if msg == WM_APP_REHOTKEY:
-        _reregister_hotkey()
+        try:
+            _reregister_hotkey()
+        except Exception:
+            _log("_reregister_hotkey 异常:\n" + traceback.format_exc())
+        return 0
+    if msg == WM_APP_REARM:
+        # 看门狗周期性触发:按当前生效的组合重新注册,兜底自愈"热键哑掉"
+        try:
+            _user32.UnregisterHotKey(hwnd, HOTKEY_ID)
+            if not _user32.RegisterHotKey(
+                    hwnd, HOTKEY_ID, _hotkey_mods, _hotkey_vk):
+                _log("看门狗重注册失败(可能被占用):"
+                     + _format_hotkey(_hotkey_mods & ~MOD_NOREPEAT, _hotkey_vk))
+        except Exception:
+            _log("WM_APP_REARM 异常:\n" + traceback.format_exc())
         return 0
     if msg == win32con.WM_MENUSELECT:
         # wParam: 低字=菜单项 id(或子菜单索引), 高字=菜单标志
@@ -998,35 +1046,88 @@ def _hotkey_wndproc(hwnd, msg, wparam, lparam):
     return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
 
-def hotkey_loop():
-    """后台线程:创建隐藏窗口、注册全局热键并跑消息循环。"""
+def _hotkey_loop_once():
+    """跑一轮:建窗口、注册热键、进消息循环。正常情况下会一直阻塞在
+    PumpMessages;只有窗口被销毁或出异常才返回。"""
     global _hotkey_hwnd
+    global _hotkey_class_seq
+    hinst = win32gui.GetModuleHandle(None)
+    # 每轮用唯一类名,避免重建时"类名已存在"导致 RegisterClass 失败
+    _hotkey_class_seq += 1
+    cls_name = "ExplorerPathTrayHotkey%d" % _hotkey_class_seq
+    wc = win32gui.WNDCLASS()
+    wc.lpszClassName = cls_name
+    wc.lpfnWndProc = _hotkey_wndproc
+    wc.hInstance = hinst
+    class_atom = win32gui.RegisterClass(wc)
+    hwnd = win32gui.CreateWindow(
+        class_atom, cls_name, 0, 0, 0, 0, 0, 0, 0, hinst, None)
+    _hotkey_hwnd = hwnd
+
+    if not _user32.RegisterHotKey(
+            hwnd, HOTKEY_ID, _hotkey_mods, _hotkey_vk):
+        # 注册失败(多半是热键已被占用),提示一下;不退出,
+        # 这样用户仍可通过菜单把它改成别的可用组合。
+        _log("初始注册热键失败:"
+             + _format_hotkey(_hotkey_mods & ~MOD_NOREPEAT, _hotkey_vk))
+        _notify("快捷键 "
+                + _format_hotkey(_hotkey_mods & ~MOD_NOREPEAT, _hotkey_vk)
+                + " 注册失败(可能已被占用),可在菜单里改成别的组合")
+    else:
+        _log("热键已注册:"
+             + _format_hotkey(_hotkey_mods & ~MOD_NOREPEAT, _hotkey_vk))
+
+    try:
+        win32gui.PumpMessages()
+    finally:
+        try:
+            _user32.UnregisterHotKey(hwnd, HOTKEY_ID)
+        except Exception:
+            pass
+        try:
+            win32gui.DestroyWindow(hwnd)
+        except Exception:
+            pass
+        _hotkey_hwnd = None
+
+
+def hotkey_loop():
+    """后台线程:注册全局热键并跑消息循环。用 while 外壳兜底:
+    只要不是用户主动退出(_stop_event),PumpMessages 一旦返回(收到 WM_QUIT)
+    或出异常,都会短暂等待后重建,避免热键"过一段时间就永久失灵"。"""
     pythoncom.CoInitialize()
     try:
-        hinst = win32gui.GetModuleHandle(None)
-        wc = win32gui.WNDCLASS()
-        wc.lpszClassName = "ExplorerPathTrayHotkey"
-        wc.lpfnWndProc = _hotkey_wndproc
-        wc.hInstance = hinst
-        class_atom = win32gui.RegisterClass(wc)
-        hwnd = win32gui.CreateWindow(
-            class_atom, "ExplorerPathTrayHotkey", 0, 0, 0, 0, 0, 0, 0, hinst, None)
-        _hotkey_hwnd = hwnd
-
-        if not _user32.RegisterHotKey(
-                hwnd, HOTKEY_ID, _hotkey_mods, _hotkey_vk):
-            # 注册失败(多半是热键已被占用),提示一下;不退出线程,
-            # 这样用户仍可通过菜单把它改成别的可用组合。
-            _notify("快捷键 "
-                    + _format_hotkey(_hotkey_mods & ~MOD_NOREPEAT, _hotkey_vk)
-                    + " 注册失败(可能已被占用),可在菜单里改成别的组合")
-
-        try:
-            win32gui.PumpMessages()
-        finally:
-            _user32.UnregisterHotKey(hwnd, HOTKEY_ID)
+        while not _stop_event.is_set():
+            try:
+                _hotkey_loop_once()
+            except Exception:
+                _log("hotkey_loop 异常:\n" + traceback.format_exc())
+            if _stop_event.is_set():
+                _log("hotkey_loop:应用退出,结束")
+                break
+            # 走到这里 = PumpMessages 意外返回(线程收到 WM_QUIT 但并非用户退出)。
+            # 这正是"热键突然失灵"的机制;重建窗口与热键即可自愈。
+            _log("hotkey_loop:消息循环意外退出,1 秒后重建热键")
+            time.sleep(1)
     finally:
         pythoncom.CoUninitialize()
+
+
+def hotkey_watchdog_loop():
+    """看门狗:周期性让热键窗口按当前组合重新注册一次,兜底自愈
+    '热键莫名哑掉'的情况;同时写一条心跳日志便于排查。"""
+    while not _stop_event.is_set():
+        if _stop_event.wait(300):   # 每 5 分钟一次;被置位则立即返回退出
+            break
+        hwnd = _hotkey_hwnd
+        if hwnd:
+            try:
+                win32gui.PostMessage(hwnd, WM_APP_REARM, 0, 0)
+                _log("看门狗心跳:已请求重注册热键")
+            except Exception:
+                _log("看门狗 PostMessage 失败:\n" + traceback.format_exc())
+        else:
+            _log("看门狗心跳:热键窗口不存在(等待 hotkey_loop 重建)")
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1164,7 @@ def main():
         icon.visible = True
         threading.Thread(target=poll_loop, daemon=True).start()
         threading.Thread(target=hotkey_loop, daemon=True).start()
+        threading.Thread(target=hotkey_watchdog_loop, daemon=True).start()
         if CURSOR_ENABLED:
             threading.Thread(target=cursor_watch_loop, daemon=True).start()
 
