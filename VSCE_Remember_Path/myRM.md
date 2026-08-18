@@ -1,1 +1,0 @@
-mklink /d    "C:\Users\92892\.cursor\extensions\Remember_Path"   "D:\files\using\Python\P_Explorer_Path_Tray\VSCE_Remember_Path"

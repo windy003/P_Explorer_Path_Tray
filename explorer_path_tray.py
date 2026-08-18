@@ -8,6 +8,7 @@ Explorer 路径历史托盘工具
   - 右键托盘图标 -> 显示最近 10 条路径历史(最新的在最上面)。
   - 点击某条路径 -> 用资源管理器打开它。
   - 弹出菜单后高亮某条路径(鼠标悬停或方向键)并按 Ctrl+C -> 复制该路径。
+  - 弹出菜单期间按 Ctrl+F -> 弹出搜索框,输入关键字实时过滤路径,回车打开选中项。
   - 菜单里「自定义快捷键」-> 弹窗按下任意组合键,即可改掉默认的弹出热键。
   - 历史与配置会保存到本地文件,重启后仍在。
 
@@ -21,6 +22,7 @@ import json
 import time
 import threading
 import traceback
+import subprocess
 
 import pythoncom
 import win32com.client
@@ -364,6 +366,22 @@ def _on_quit(icon, item):
     _quit_app()
 
 
+def _restart_app():
+    """拉起一个新进程(同样的解释器 + 脚本参数),再退出当前进程。"""
+    try:
+        subprocess.Popen([sys.executable] + sys.argv, close_fds=True)
+    except Exception:
+        _log("重启失败:\n" + traceback.format_exc())
+        _notify("重启失败,请查看日志")
+        return
+    _log("用户请求重启,已拉起新进程")
+    _quit_app()
+
+
+def _on_restart(icon, item):
+    _restart_app()
+
+
 def menu_items():
     """动态生成菜单项,每次右键弹出时都会重新求值。"""
     snapshot = history_snapshot()
@@ -376,6 +394,7 @@ def menu_items():
             yield pystray.MenuItem(label, _make_open(path))
     yield pystray.Menu.SEPARATOR
     yield pystray.MenuItem("自定义快捷键…", _on_set_hotkey)
+    yield pystray.MenuItem("重启(&R)", _on_restart)
     yield pystray.MenuItem("退出(&X)", _on_quit)
 
 
@@ -426,6 +445,7 @@ VK_MENU = 0x12          # Alt
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 VK_C = 0x43
+VK_F = 0x46
 
 _user32 = ctypes.windll.user32
 _HOOKPROC = ctypes.CFUNCTYPE(
@@ -501,12 +521,22 @@ def _try_copy_highlighted():
     return True
 
 
+_search_requested = False   # 菜单显示期间按了 Ctrl+F,菜单关闭后需要弹出搜索框
+
+
 def _ll_keyboard_proc(nCode, wParam, lParam):
+    global _search_requested
     if nCode == 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
         kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
-        if kb.vkCode == VK_C and (_user32.GetAsyncKeyState(VK_CONTROL) & 0x8000):
+        ctrl_down = _user32.GetAsyncKeyState(VK_CONTROL) & 0x8000
+        if kb.vkCode == VK_C and ctrl_down:
             if _try_copy_highlighted():
                 return 1     # 吞掉这次 Ctrl+C,不再向下传递
+        elif kb.vkCode == VK_F and ctrl_down:
+            # 关掉当前原生菜单,交给外层弹出搜索窗口(原生弹出菜单本身不支持输入文字)
+            _search_requested = True
+            _user32.EndMenu()
+            return 1
     return _user32.CallNextHookEx(None, nCode, wParam, lParam)
 
 
@@ -894,6 +924,129 @@ def _on_set_hotkey(icon=None, item=None):
     threading.Thread(target=_capture_hotkey_dialog, daemon=True).start()
 
 
+# ---------------------------------------------------------------------------
+# 面板内 Ctrl+F 搜索
+# ---------------------------------------------------------------------------
+_search_dialog_open = False
+
+
+def _capture_search_dialog():
+    """弹出搜索窗口:输入关键字实时过滤历史路径,回车/双击打开选中项。"""
+    global _search_dialog_open
+    if _search_dialog_open:
+        return
+    _search_dialog_open = True
+    try:
+        import tkinter as tk
+    except Exception:
+        _notify("无法打开搜索窗口(缺少 tkinter)")
+        _search_dialog_open = False
+        return
+
+    all_paths = history_snapshot()
+
+    root = tk.Tk()
+    root.title("搜索路径历史")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+
+    entry_var = tk.StringVar()
+    entry = tk.Entry(root, textvariable=entry_var, width=70, font=("Segoe UI", 11))
+    entry.pack(padx=10, pady=(10, 4), fill="x")
+
+    listbox = tk.Listbox(root, width=90, height=12, font=("Segoe UI", 10),
+                          activestyle="dotbox", exportselection=False)
+    listbox.pack(padx=10, pady=(0, 10), fill="both", expand=True)
+
+    def refresh(*_args):
+        kw = entry_var.get().strip().lower()
+        listbox.delete(0, tk.END)
+        for p in all_paths:
+            if not kw or kw in p.lower():
+                listbox.insert(tk.END, p)
+        if listbox.size() > 0:
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(0)
+            listbox.activate(0)
+
+    entry_var.trace_add("write", refresh)
+
+    def open_selected(event=None):
+        sel = listbox.curselection()
+        if sel:
+            path = listbox.get(sel[0])
+            root.destroy()
+            open_path(path)
+        return "break"
+
+    def move_selection(delta):
+        size = listbox.size()
+        if size == 0:
+            return
+        cur = listbox.curselection()
+        idx = cur[0] if cur else -1
+        idx = max(0, min(size - 1, idx + delta))
+        listbox.selection_clear(0, tk.END)
+        listbox.selection_set(idx)
+        listbox.activate(idx)
+        listbox.see(idx)
+
+    def on_down(event):
+        move_selection(1)
+        return "break"
+
+    def on_up(event):
+        move_selection(-1)
+        return "break"
+
+    def cancel(event=None):
+        root.destroy()
+
+    def copy_selected(event=None):
+        sel = listbox.curselection()
+        if sel:
+            path = listbox.get(sel[0])
+            _copy_path_async(path)
+        return "break"   # 阻止输入框默认的"复制选中文字"行为
+
+    entry.bind("<Return>", open_selected)
+    entry.bind("<Down>", on_down)
+    entry.bind("<Up>", on_up)
+    entry.bind("<Escape>", cancel)
+    entry.bind("<Control-c>", copy_selected)
+    entry.bind("<Control-C>", copy_selected)
+    listbox.bind("<Return>", open_selected)
+    listbox.bind("<Double-Button-1>", open_selected)
+    listbox.bind("<Escape>", cancel)
+    listbox.bind("<Control-c>", copy_selected)
+    listbox.bind("<Control-C>", copy_selected)
+    root.bind("<Escape>", cancel)
+
+    refresh()
+
+    root.update_idletasks()
+    w, h = root.winfo_width(), root.winfo_height()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry("+{}+{}".format((sw - w) // 2, (sh - h) // 3))
+
+    root.lift()
+    root.focus_force()
+    entry.focus_set()
+    try:
+        root.mainloop()
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        _search_dialog_open = False
+
+
+def _open_search_dialog():
+    # tkinter 在独立线程跑自己的 mainloop,避免阻塞热键消息循环
+    threading.Thread(target=_capture_search_dialog, daemon=True).start()
+
+
 class _GUID(ctypes.Structure):
     _fields_ = [("Data1", ctypes.c_ulong),
                 ("Data2", ctypes.c_ushort),
@@ -938,10 +1091,11 @@ def _get_tray_icon_rect():
 
 def _show_popup_menu(hwnd):
     """在鼠标位置弹出与右键托盘一致的菜单。"""
-    global _popup_actions, _menu_highlight_id
+    global _popup_actions, _menu_highlight_id, _search_requested
     hmenu = win32gui.CreatePopupMenu()
     _popup_actions = {}  # 菜单项 id -> (类型, 数据)
     _menu_highlight_id = 0
+    _search_requested = False
     next_id = 1
     snapshot = history_snapshot()
     if not snapshot:
@@ -958,6 +1112,9 @@ def _show_popup_menu(hwnd):
     win32gui.AppendMenu(hmenu, win32con.MF_SEPARATOR, 0, "")
     win32gui.AppendMenu(hmenu, win32con.MF_STRING, next_id, "自定义快捷键…")
     _popup_actions[next_id] = ("set_hotkey", None)
+    next_id += 1
+    win32gui.AppendMenu(hmenu, win32con.MF_STRING, next_id, "重启(&R)")
+    _popup_actions[next_id] = ("restart", None)
     next_id += 1
     win32gui.AppendMenu(hmenu, win32con.MF_STRING, next_id, "退出(&X)")
     _popup_actions[next_id] = ("quit", None)
@@ -988,6 +1145,11 @@ def _show_popup_menu(hwnd):
     win32gui.PostMessage(hwnd, win32con.WM_NULL, 0, 0)
     win32gui.DestroyMenu(hmenu)
 
+    if _search_requested:
+        _search_requested = False
+        _open_search_dialog()
+        return
+
     action = _popup_actions.get(cmd)
     if action:
         kind, data = action
@@ -995,6 +1157,8 @@ def _show_popup_menu(hwnd):
             open_path(data)
         elif kind == "set_hotkey":
             _on_set_hotkey()
+        elif kind == "restart":
+            _restart_app()
         elif kind == "quit":
             _quit_app()
 
