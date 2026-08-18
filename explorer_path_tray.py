@@ -435,6 +435,9 @@ _hotkey_class_seq = 0      # 窗口类名计数,保证每轮重建用到唯一�
 _menu_highlight_id = 0   # 当前高亮菜单项 id(由 WM_MENUSELECT 维护)
 _popup_actions = {}      # 菜单项 id -> (类型, 数据)
 _menu_open = False       # 弹出菜单是否正在显示(用于热键的显示/关闭切换)
+_menu_history_count = 0  # 当前菜单里历史路径条目数(id 1..此值),用于翻页/首尾跳转
+_menu_min_id = 0         # 当前菜单里可选中项的最小 id,用于禁止上下键在首尾环绕
+_menu_max_id = 0         # 当前菜单里可选中项的最大 id,用于禁止上下键在首尾环绕
 
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
@@ -446,6 +449,13 @@ VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 VK_C = 0x43
 VK_F = 0x46
+VK_PRIOR = 0x21         # PageUp
+VK_NEXT = 0x22          # PageDown
+VK_HOME_KEY = 0x24
+VK_END_KEY = 0x23
+VK_UP_KEY = 0x26
+VK_DOWN_KEY = 0x28
+PAGE_SIZE = 10          # PageUp/PageDown 一次跳过的条目数
 
 _user32 = ctypes.windll.user32
 _HOOKPROC = ctypes.CFUNCTYPE(
@@ -524,6 +534,42 @@ def _try_copy_highlighted():
 _search_requested = False   # 菜单显示期间按了 Ctrl+F,菜单关闭后需要弹出搜索框
 
 
+def _menu_page_navigate(kind):
+    """把历史列表的高亮移动到目标位置。
+
+    原生弹出菜单没有翻页/首尾跳转语义,这里通过模拟 Up/Down 按键补齐:
+    从未高亮任何项的状态开始,第 1 次 Down 落在第 1 项、第 n 次落在第 n 项,
+    已高亮某项时则用 Up/Down 的次数差直接移动过去,避免顶部/底部的环绕。
+    kind: 'home' / 'end' / 'pgup' / 'pgdn'。
+    """
+    count = _menu_history_count
+    if count <= 0:
+        return
+    cur = _menu_highlight_id
+    current = cur if 1 <= cur <= count else 0
+
+    if kind == "home":
+        target = 1
+    elif kind == "end":
+        target = count
+    elif kind == "pgdn":
+        target = min(count, current + PAGE_SIZE)
+    else:  # pgup
+        target = max(1, current - PAGE_SIZE) if current else 1
+
+    if current == 0:
+        for _ in range(target):
+            _send_vk(VK_DOWN_KEY)
+        return
+    delta = target - current
+    if delta > 0:
+        for _ in range(delta):
+            _send_vk(VK_DOWN_KEY)
+    elif delta < 0:
+        for _ in range(-delta):
+            _send_vk(VK_UP_KEY)
+
+
 def _ll_keyboard_proc(nCode, wParam, lParam):
     global _search_requested
     if nCode == 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
@@ -537,6 +583,26 @@ def _ll_keyboard_proc(nCode, wParam, lParam):
             _search_requested = True
             _user32.EndMenu()
             return 1
+        elif kb.vkCode == VK_HOME_KEY:
+            _menu_page_navigate("home")
+            return 1
+        elif kb.vkCode == VK_END_KEY:
+            _menu_page_navigate("end")
+            return 1
+        elif kb.vkCode == VK_PRIOR:
+            _menu_page_navigate("pgup")
+            return 1
+        elif kb.vkCode == VK_NEXT:
+            _menu_page_navigate("pgdn")
+            return 1
+        elif kb.vkCode == VK_UP_KEY:
+            # 已在最顶部时吞掉按键,禁止环绕到最底部
+            if _menu_highlight_id != 0 and _menu_highlight_id == _menu_min_id:
+                return 1
+        elif kb.vkCode == VK_DOWN_KEY:
+            # 已在最底部时吞掉按键,禁止环绕到最顶部
+            if _menu_highlight_id != 0 and _menu_highlight_id == _menu_max_id:
+                return 1
     return _user32.CallNextHookEx(None, nCode, wParam, lParam)
 
 
@@ -1092,6 +1158,7 @@ def _get_tray_icon_rect():
 def _show_popup_menu(hwnd):
     """在鼠标位置弹出与右键托盘一致的菜单。"""
     global _popup_actions, _menu_highlight_id, _search_requested
+    global _menu_history_count, _menu_min_id, _menu_max_id
     hmenu = win32gui.CreatePopupMenu()
     _popup_actions = {}  # 菜单项 id -> (类型, 数据)
     _menu_highlight_id = 0
@@ -1102,6 +1169,7 @@ def _show_popup_menu(hwnd):
         win32gui.AppendMenu(
             hmenu, win32con.MF_STRING | win32con.MF_GRAYED, next_id, "(暂无浏览记录)")
         next_id += 1
+        _menu_history_count = 0
     else:
         for path in snapshot:
             # '&' 在菜单文字里是助记符,需转义成 '&&' 才会原样显示
@@ -1109,6 +1177,7 @@ def _show_popup_menu(hwnd):
                 hmenu, win32con.MF_STRING, next_id, path.replace("&", "&&"))
             _popup_actions[next_id] = ("open", path)
             next_id += 1
+        _menu_history_count = len(snapshot)
     win32gui.AppendMenu(hmenu, win32con.MF_SEPARATOR, 0, "")
     win32gui.AppendMenu(hmenu, win32con.MF_STRING, next_id, "自定义快捷键…")
     _popup_actions[next_id] = ("set_hotkey", None)
@@ -1118,6 +1187,9 @@ def _show_popup_menu(hwnd):
     next_id += 1
     win32gui.AppendMenu(hmenu, win32con.MF_STRING, next_id, "退出(&X)")
     _popup_actions[next_id] = ("quit", None)
+
+    _menu_min_id = min(_popup_actions)
+    _menu_max_id = max(_popup_actions)
 
     # 菜单位置:锚定到托盘图标右上角,并用与右键一致的右下对齐,
     # 让菜单贴着图标向左上展开;取不到图标位置时回退到鼠标处。
